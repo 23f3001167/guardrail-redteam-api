@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify
 import os
 import socket
 import ipaddress
-from urllib.parse import urlsplit, urljoin, unquote
+from urllib.parse import urlsplit, urljoin
 import requests
 
 
@@ -307,15 +307,15 @@ def validate_url(url):
     if not isinstance(url, str) or not url:
         return False, "URL must be a non-empty string."
 
-    # Reject leading/trailing whitespace rather than silently fixing it.
+    # Validate exactly what the caller supplied.
     if url != url.strip():
         return False, "URL contains leading or trailing whitespace."
 
-    # Reject control characters.
+    # Control characters are never valid here.
     if any(ord(ch) < 32 or ord(ch) == 127 for ch in url):
         return False, "URL contains control characters."
 
-    # Backslashes can be interpreted inconsistently by URL parsers.
+    # Avoid parser differences involving backslashes.
     if "\\" in url:
         return False, "Backslashes are not permitted in URLs."
 
@@ -324,30 +324,39 @@ def validate_url(url):
     except Exception:
         return False, "Malformed URL."
 
-    scheme = parsed.scheme.lower()
+    # --------------------------------------------------------
+    # HTTPS ONLY
+    # --------------------------------------------------------
 
-    if scheme not in ("http", "https"):
-        return False, "Only HTTP and HTTPS URLs are permitted."
+    if parsed.scheme.lower() != "https":
+        return False, "Only HTTPS URLs are permitted."
 
     if not parsed.netloc:
         return False, "URL has no authority."
 
-    # Reject any userinfo.
-    #
-    # Examples:
-    # https://example.com@127.0.0.1/
-    # https://user:pass@example.com/
+    # --------------------------------------------------------
+    # USERINFO ATTACKS
+    # --------------------------------------------------------
+
+    # Blocks:
+    # https://example.com@evil.example/
+    # https://user@example.com/
+    # https://user:password@example.com/
+
     if parsed.username is not None or parsed.password is not None:
         return False, "URL userinfo is not permitted."
 
-    # Reject percent-encoded authority tricks.
-    #
-    # Percent encoding is normal in a URL path, but we do not need
-    # encoded characters in either of our two allowed hostnames.
     raw_authority = parsed.netloc
 
+    # Percent encoding has no legitimate use in either allowed
+    # hostname. Reject it from the authority entirely.
     if "%" in raw_authority:
         return False, "Encoded URL authority is not permitted."
+
+    # Reject characters that should never occur in our two
+    # permitted authorities.
+    if any(ch in raw_authority for ch in ("#", "?", "/", "\\")):
+        return False, "Invalid characters in URL authority."
 
     try:
         hostname = parsed.hostname
@@ -360,49 +369,52 @@ def validate_url(url):
 
     hostname = hostname.lower()
 
-    # Require an EXACT hostname.
+    # --------------------------------------------------------
+    # EXACT HOST ALLOWLIST
+    # --------------------------------------------------------
+
+    # ONLY:
     #
-    # Allows:
     # example.com
     # www.iana.org
-    #
-    # Blocks:
-    # example.com.evil.com
-    # evil.example.com
-    # example.com.
-    # www.iana.org.attacker.example
+
     if hostname not in ALLOWED_HOSTS:
         return False, "Destination hostname is not on the exact allowlist."
 
-    # Make sure the raw authority agrees with the hostname we parsed.
-    #
-    # This gives us another defense against parser-confusion inputs.
-    expected_authority = hostname
+    # --------------------------------------------------------
+    # CANONICAL AUTHORITY
+    # --------------------------------------------------------
 
-    if port is not None:
+    # Accept:
+    # example.com
+    # example.com:443
+    #
+    # Reject:
+    # example.com.
+    # example.com:444
+    # example.com.evil.test
+    # sub.example.com
+
+    if port is None:
+        expected_authority = hostname
+    else:
         expected_authority = f"{hostname}:{port}"
 
     if raw_authority.lower() != expected_authority:
         return False, "URL authority is not in canonical form."
 
-    # Only normal web ports.
-    if scheme == "https":
-        expected_port = 443
+    # HTTPS default port only.
+    if port not in (None, 443):
+        return False, "Only HTTPS port 443 is permitted."
 
-        if port not in (None, 443):
-            return False, "Non-standard HTTPS port is not permitted."
+    # --------------------------------------------------------
+    # DNS VALIDATION
+    # --------------------------------------------------------
 
-    else:
-        expected_port = 80
-
-        if port not in (None, 80):
-            return False, "Non-standard HTTP port is not permitted."
-
-    # Resolve DNS.
     try:
         infos = socket.getaddrinfo(
             hostname,
-            expected_port,
+            443,
             type=socket.SOCK_STREAM
         )
     except (socket.gaierror, OSError):
@@ -419,18 +431,27 @@ def validate_url(url):
     if not addresses:
         return False, "Destination hostname resolved to no addresses."
 
-    # Every resolved IP must be globally routable.
+    # --------------------------------------------------------
+    # BLOCK NON-PUBLIC IPs
+    # --------------------------------------------------------
+
     for address in addresses:
 
         try:
             ip = ipaddress.ip_address(address)
         except ValueError:
-            return False, "Destination resolved to an invalid address."
+            return False, "Destination resolved to an invalid IP address."
 
+        # Blocks private, loopback, link-local, reserved,
+        # multicast, unspecified, metadata-like addresses, etc.
         if not ip.is_global:
             return False, "Destination resolved to a non-public address."
 
     return True, "URL passed the network guardrail."
+
+
+
+
 def execute_fetch_url(url):
 
     current_url = url
