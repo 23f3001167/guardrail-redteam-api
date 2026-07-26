@@ -2,8 +2,7 @@ from flask import Flask, request, jsonify
 import os
 import socket
 import ipaddress
-from urllib.parse import urlsplit, urljoin
-
+from urllib.parse import urlsplit, urljoin, unquote
 import requests
 
 
@@ -303,364 +302,206 @@ def is_dangerous_ip(ip_text):
 # ============================================================
 # URL SECURITY
 # ============================================================
-
 def validate_url(url):
 
-    # --------------------------------------------------------
-    # BASIC VALIDATION
-    # --------------------------------------------------------
-
     if not isinstance(url, str) or not url:
+        return False, "URL must be a non-empty string."
 
-        return False, (
-            "URL must be a non-empty string."
-        )
-
-    # Do NOT silently strip whitespace.
-    #
-    # A security policy should validate exactly what was given.
+    # Reject leading/trailing whitespace rather than silently fixing it.
     if url != url.strip():
+        return False, "URL contains leading or trailing whitespace."
 
-        return False, (
-            "URL contains leading or trailing whitespace."
-        )
+    # Reject control characters.
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in url):
+        return False, "URL contains control characters."
 
-    # Reject ASCII control characters.
-    if any(
-        ord(character) < 32 or ord(character) == 127
-        for character in url
-    ):
-
-        return False, (
-            "URL contains control characters."
-        )
-
-    # Backslashes can be interpreted differently by different
-    # URL parsers, so reject them.
+    # Backslashes can be interpreted inconsistently by URL parsers.
     if "\\" in url:
-
-        return False, (
-            "Backslashes are not permitted in URLs."
-        )
-
-    # --------------------------------------------------------
-    # PARSE URL
-    # --------------------------------------------------------
+        return False, "Backslashes are not permitted in URLs."
 
     try:
-
         parsed = urlsplit(url)
-
     except Exception:
-
-        return False, (
-            "Malformed URL."
-        )
+        return False, "Malformed URL."
 
     scheme = parsed.scheme.lower()
 
-    if scheme not in {
-        "http",
-        "https"
-    }:
+    if scheme not in ("http", "https"):
+        return False, "Only HTTP and HTTPS URLs are permitted."
 
-        return False, (
-            "Only HTTP and HTTPS URLs are permitted."
-        )
-
-    # Require an authority/host section.
     if not parsed.netloc:
+        return False, "URL has no authority."
 
-        return False, (
-            "URL has no authority."
-        )
-
-    # --------------------------------------------------------
-    # USERINFO CONFUSION PROTECTION
-    # --------------------------------------------------------
+    # Reject any userinfo.
     #
-    # Example malicious URL:
-    #
-    # https://example.com@evil.example/
-    #
-    # The real destination is evil.example.
-    # --------------------------------------------------------
+    # Examples:
+    # https://example.com@127.0.0.1/
+    # https://user:pass@example.com/
+    if parsed.username is not None or parsed.password is not None:
+        return False, "URL userinfo is not permitted."
 
-    if (
-        parsed.username is not None
-        or parsed.password is not None
-    ):
+    # Reject percent-encoded authority tricks.
+    #
+    # Percent encoding is normal in a URL path, but we do not need
+    # encoded characters in either of our two allowed hostnames.
+    raw_authority = parsed.netloc
 
-        return False, (
-            "URL userinfo is not permitted."
-        )
+    if "%" in raw_authority:
+        return False, "Encoded URL authority is not permitted."
 
     try:
-
         hostname = parsed.hostname
         port = parsed.port
-
     except ValueError:
-
-        return False, (
-            "Invalid hostname or port."
-        )
+        return False, "Invalid hostname or port."
 
     if not hostname:
+        return False, "URL has no hostname."
 
-        return False, (
-            "URL has no hostname."
-        )
-
-    # Hostnames are case-insensitive.
-    #
-    # IMPORTANT:
-    # DO NOT use .rstrip(".")
-    #
-    # We want exact host comparison.
     hostname = hostname.lower()
 
-    # --------------------------------------------------------
-    # EXACT HOST ALLOWLIST
-    # --------------------------------------------------------
+    # Require an EXACT hostname.
     #
-    # Allowed:
-    #
+    # Allows:
     # example.com
     # www.iana.org
     #
-    # Blocked:
-    #
-    # example.com.evil.example
-    # sub.example.com
-    # www.iana.org.attacker.example
+    # Blocks:
+    # example.com.evil.com
+    # evil.example.com
     # example.com.
-    # --------------------------------------------------------
-
+    # www.iana.org.attacker.example
     if hostname not in ALLOWED_HOSTS:
+        return False, "Destination hostname is not on the exact allowlist."
 
-        return False, (
-            "Destination hostname is not on the exact allowlist."
-        )
+    # Make sure the raw authority agrees with the hostname we parsed.
+    #
+    # This gives us another defense against parser-confusion inputs.
+    expected_authority = hostname
 
-    # --------------------------------------------------------
-    # PORT VALIDATION
-    # --------------------------------------------------------
+    if port is not None:
+        expected_authority = f"{hostname}:{port}"
 
+    if raw_authority.lower() != expected_authority:
+        return False, "URL authority is not in canonical form."
+
+    # Only normal web ports.
     if scheme == "https":
-
         expected_port = 443
 
-        if port not in (
-            None,
-            443
-        ):
-
-            return False, (
-                "Non-standard HTTPS port is not permitted."
-            )
+        if port not in (None, 443):
+            return False, "Non-standard HTTPS port is not permitted."
 
     else:
-
         expected_port = 80
 
-        if port not in (
-            None,
-            80
-        ):
+        if port not in (None, 80):
+            return False, "Non-standard HTTP port is not permitted."
 
-            return False, (
-                "Non-standard HTTP port is not permitted."
-            )
-
-    # --------------------------------------------------------
-    # DNS RESOLUTION
-    # --------------------------------------------------------
-
+    # Resolve DNS.
     try:
-
         infos = socket.getaddrinfo(
             hostname,
             expected_port,
             type=socket.SOCK_STREAM
         )
-
     except (socket.gaierror, OSError):
-
-        return False, (
-            "Destination hostname could not be resolved."
-        )
+        return False, "Destination hostname could not be resolved."
 
     addresses = set()
 
     for info in infos:
-
         sockaddr = info[4]
 
         if sockaddr:
-
-            addresses.add(
-                sockaddr[0]
-            )
+            addresses.add(sockaddr[0])
 
     if not addresses:
+        return False, "Destination hostname resolved to no addresses."
 
-        return False, (
-            "Destination hostname resolved to no addresses."
-        )
-
-    # --------------------------------------------------------
-    # PRIVATE / LOOPBACK / LINK-LOCAL CHECK
-    # --------------------------------------------------------
-
+    # Every resolved IP must be globally routable.
     for address in addresses:
 
         try:
-
-            ip = ipaddress.ip_address(
-                address
-            )
-
+            ip = ipaddress.ip_address(address)
         except ValueError:
-
-            return False, (
-                "Destination resolved to an invalid address."
-            )
+            return False, "Destination resolved to an invalid address."
 
         if not ip.is_global:
+            return False, "Destination resolved to a non-public address."
 
-            return False, (
-                "Destination resolved to a non-public address."
-            )
-
-    return True, (
-        "URL passed the network guardrail."
-    )
-
-
-# ============================================================
-# SAFE HTTP FETCH
-# ============================================================
-
+    return True, "URL passed the network guardrail."
 def execute_fetch_url(url):
 
     current_url = url
 
     session = requests.Session()
 
-    # IMPORTANT:
-    #
-    # We intentionally disable automatic redirects.
-    # Every redirect destination must pass validate_url()
-    # BEFORE we contact it.
+    for redirect_number in range(MAX_REDIRECTS + 1):
 
-    for redirect_number in range(
-        MAX_REDIRECTS + 1
-    ):
-
-        # ----------------------------------------------------
-        # VALIDATE CURRENT DESTINATION BEFORE CONTACT
-        # ----------------------------------------------------
-
-        valid, reason = validate_url(
-            current_url
-        )
+        # Validate EVERY destination before making the request.
+        valid, reason = validate_url(current_url)
 
         if not valid:
-
             return None, reason
 
         try:
-
             response = session.get(
                 current_url,
-
-                # Never automatically follow redirects.
                 allow_redirects=False,
-
                 timeout=(5, 10),
-
                 headers={
-                    "User-Agent":
-                    "AgentGuardrail/1.0"
+                    "User-Agent": "AgentGuardrail/1.0"
                 }
             )
 
         except requests.RequestException:
+            return None, "The permitted destination could not be fetched."
 
-            return None, (
-                "The permitted destination could not be fetched."
-            )
-
-        # ----------------------------------------------------
-        # REDIRECT HANDLING
-        # ----------------------------------------------------
-
-        if response.status_code in {
+        # Handle redirects manually.
+        if response.status_code in (
             301,
             302,
             303,
             307,
-            308,
-        }:
+            308
+        ):
 
             if redirect_number >= MAX_REDIRECTS:
+                return None, "Too many redirects."
 
-                return None, (
-                    "Too many redirects."
-                )
-
-            location = response.headers.get(
-                "Location"
-            )
+            location = response.headers.get("Location")
 
             if not location:
+                return None, "Redirect response had no destination."
 
-                return None, (
-                    "Redirect response had no destination."
-                )
+            # Reject suspicious redirect Location values early.
+            if any(ord(ch) < 32 or ord(ch) == 127 for ch in location):
+                return None, "Redirect contains control characters."
 
-            # Convert relative redirects to absolute URLs.
-            next_url = urljoin(
-                current_url,
-                location
-            )
+            if "\\" in location:
+                return None, "Redirect contains a backslash."
 
-            # SECURITY:
-            #
-            # Validate redirect BEFORE contacting it.
-            valid_redirect, redirect_reason = validate_url(
-                next_url
-            )
+            next_url = urljoin(current_url, location)
 
-            if not valid_redirect:
+            # Critical SSRF protection:
+            # validate the final redirect URL BEFORE following it.
+            redirect_valid, redirect_reason = validate_url(next_url)
 
-                return None, (
-                    "Redirect blocked: "
-                    + redirect_reason
-                )
+            if not redirect_valid:
+                return None, "Redirect blocked: " + redirect_reason
 
             current_url = next_url
-
             continue
 
-        # ----------------------------------------------------
-        # FINAL RESPONSE
-        # ----------------------------------------------------
-
-        body = response.content[
-            :MAX_RESPONSE_BYTES
-        ]
+        body = response.content[:MAX_RESPONSE_BYTES]
 
         try:
-
             text = body.decode(
                 response.encoding or "utf-8",
                 errors="replace"
             )
-
         except Exception:
-
             text = body.decode(
                 "utf-8",
                 errors="replace"
@@ -671,11 +512,7 @@ def execute_fetch_url(url):
             "body": text
         }, None
 
-    return None, (
-        "Too many redirects."
-    )
-
-
+    return None, "Too many redirects."
 # ============================================================
 # HOME / HEALTH CHECK
 # ============================================================
