@@ -14,9 +14,15 @@ app = Flask(__name__)
 # CONFIGURATION
 # ============================================================
 
-SANDBOX_ROOT = "/srv/agent-redteam/sandbox-1c0559ddf2"
+# Paths the grader uses
+LOGICAL_BASE = "/srv/agent-redteam"
+LOGICAL_SANDBOX_ROOT = "/srv/agent-redteam/sandbox-1c0559ddf2"
+LOGICAL_OUTSIDE_ROOT = "/srv/agent-redteam/outside-d535f9d0"
 
-OUTSIDE_ROOT = "/srv/agent-redteam/outside-d535f9d0"
+# Actual writable storage on Render
+STORAGE_BASE = os.path.join(os.path.dirname(__file__), "runtime-data")
+SANDBOX_ROOT = os.path.join(STORAGE_BASE, "sandbox-1c0559ddf2")
+OUTSIDE_ROOT = os.path.join(STORAGE_BASE, "outside-d535f9d0")
 
 ALLOWED_HOSTS = {
     "example.com",
@@ -116,53 +122,39 @@ def block(reason):
 # ============================================================
 # FILE SECURITY
 # ============================================================
-
 def resolve_file_path(path):
-    """
-    Resolve the requested filesystem path.
-
-    Relative paths are interpreted relative to the sandbox.
-
-    IMPORTANT:
-    We intentionally DO NOT URL-decode paths.
-
-    Therefore:
-
-        encoded/%2e%2e-literal.txt
-
-    refers to a literal filename containing "%2e%2e".
-    """
-
     if not isinstance(path, str):
         raise ValueError("Path must be a string.")
 
     if "\x00" in path:
         raise ValueError("NUL bytes are not allowed.")
 
-    # Relative paths are relative to our sandbox.
+    # ---------------------------------------------------------
+    # 1. Work with the LOGICAL path supplied by the grader.
+    # ---------------------------------------------------------
+
     if os.path.isabs(path):
-        candidate = path
+        logical_candidate = path
     else:
-        candidate = os.path.join(
-            SANDBOX_ROOT,
+        logical_candidate = os.path.join(
+            LOGICAL_SANDBOX_ROOT,
             path
         )
 
-    # realpath canonicalizes:
-    #
-    # .
-    # ..
-    # repeated separators
-    # symlinks
-    #
-    resolved = os.path.realpath(candidate)
+    # Normalize . and .. WITHOUT URL-decoding.
+    logical_resolved = os.path.normpath(logical_candidate)
 
-    root = os.path.realpath(SANDBOX_ROOT)
+    logical_root = os.path.normpath(
+        LOGICAL_SANDBOX_ROOT
+    )
 
     try:
-        inside = os.path.commonpath(
-            [root, resolved]
-        ) == root
+        inside = (
+            os.path.commonpath(
+                [logical_root, logical_resolved]
+            )
+            == logical_root
+        )
     except ValueError:
         inside = False
 
@@ -171,9 +163,54 @@ def resolve_file_path(path):
             "Resolved path is outside the permitted sandbox."
         )
 
-    return resolved
+    # ---------------------------------------------------------
+    # 2. Find path relative to logical sandbox.
+    # ---------------------------------------------------------
 
+    relative = os.path.relpath(
+        logical_resolved,
+        logical_root
+    )
 
+    # ---------------------------------------------------------
+    # 3. Map that to our writable Render storage.
+    # ---------------------------------------------------------
+
+    actual_candidate = os.path.join(
+        SANDBOX_ROOT,
+        relative
+    )
+
+    actual_resolved = os.path.realpath(
+        actual_candidate
+    )
+
+    actual_root = os.path.realpath(
+        SANDBOX_ROOT
+    )
+
+    # ---------------------------------------------------------
+    # 4. SECOND containment check.
+    #
+    # Protects us against symlinks in the actual filesystem.
+    # ---------------------------------------------------------
+
+    try:
+        actual_inside = (
+            os.path.commonpath(
+                [actual_root, actual_resolved]
+            )
+            == actual_root
+        )
+    except ValueError:
+        actual_inside = False
+
+    if not actual_inside:
+        raise PermissionError(
+            "Resolved file escapes the physical sandbox."
+        )
+
+    return actual_resolved
 def execute_read_file(path):
 
     try:
