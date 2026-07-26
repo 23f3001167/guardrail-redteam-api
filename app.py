@@ -14,13 +14,13 @@ app = Flask(__name__)
 # CONFIGURATION
 # ============================================================
 
-# Logical paths used by the exam grader
+# Logical paths used by the grader
 LOGICAL_SANDBOX_ROOT = "/srv/agent-redteam/sandbox-1c0559ddf2"
 LOGICAL_OUTSIDE_ROOT = "/srv/agent-redteam/outside-d535f9d0"
 
-# Render cannot normally create arbitrary directories under /srv,
-# so store the files in a writable directory while preserving the
-# grader's logical /srv paths.
+# Render normally cannot write directly under /srv.
+# Therefore create equivalent files inside the application
+# directory and map the grader's logical paths to them.
 STORAGE_BASE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "runtime-data"
@@ -36,6 +36,7 @@ OUTSIDE_ROOT = os.path.join(
     "outside-d535f9d0"
 )
 
+# EXACT hosts permitted by the assignment.
 ALLOWED_HOSTS = {
     "example.com",
     "www.iana.org",
@@ -96,7 +97,13 @@ def setup_files():
     }
 
     for path, content in files.items():
-        with open(path, "w", encoding="utf-8") as f:
+
+        with open(
+            path,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
             f.write(content)
 
 
@@ -126,20 +133,24 @@ def block(reason):
 
 
 # ============================================================
-# FILE GUARDRAIL
+# FILE SECURITY
 # ============================================================
 
 def resolve_file_path(path):
 
     if not isinstance(path, str):
-        raise ValueError("Path must be a string.")
+        raise ValueError(
+            "Path must be a string."
+        )
 
     if "\x00" in path:
-        raise ValueError("NUL bytes are not allowed.")
+        raise ValueError(
+            "NUL bytes are not allowed."
+        )
 
     # --------------------------------------------------------
-    # STEP 1:
-    # Convert relative paths into logical sandbox paths.
+    # STEP 1
+    # Interpret the path in the grader's logical filesystem.
     # --------------------------------------------------------
 
     if os.path.isabs(path):
@@ -148,15 +159,28 @@ def resolve_file_path(path):
 
     else:
 
+        # Relative paths are relative to the sandbox.
         logical_candidate = os.path.join(
             LOGICAL_SANDBOX_ROOT,
             path
         )
 
+    # Normalize actual filesystem traversal:
+    #
+    # notes/../notes/report.txt
+    #
+    # becomes:
+    #
+    # notes/report.txt
+    #
     # IMPORTANT:
     # Do NOT URL-decode filesystem paths.
     #
-    # %2e%2e-literal.txt is an intentionally valid filename.
+    # The filename:
+    #
+    # %2e%2e-literal.txt
+    #
+    # is supposed to remain a literal filename.
     logical_resolved = os.path.normpath(
         logical_candidate
     )
@@ -166,13 +190,13 @@ def resolve_file_path(path):
     )
 
     # --------------------------------------------------------
-    # STEP 2:
-    # Check logical containment.
+    # STEP 2
+    # Ensure normalized logical path stays inside sandbox.
     # --------------------------------------------------------
 
     try:
 
-        inside = (
+        logical_inside = (
             os.path.commonpath([
                 logical_root,
                 logical_resolved
@@ -182,23 +206,28 @@ def resolve_file_path(path):
 
     except ValueError:
 
-        inside = False
+        logical_inside = False
 
-    if not inside:
+    if not logical_inside:
 
         raise PermissionError(
             "Resolved path is outside the permitted sandbox."
         )
 
     # --------------------------------------------------------
-    # STEP 3:
-    # Convert logical /srv path into actual Render path.
+    # STEP 3
+    # Find relative location inside sandbox.
     # --------------------------------------------------------
 
     relative_path = os.path.relpath(
         logical_resolved,
         logical_root
     )
+
+    # --------------------------------------------------------
+    # STEP 4
+    # Map logical path to Render storage.
+    # --------------------------------------------------------
 
     actual_candidate = os.path.join(
         SANDBOX_ROOT,
@@ -214,10 +243,10 @@ def resolve_file_path(path):
     )
 
     # --------------------------------------------------------
-    # STEP 4:
-    # Check physical containment too.
+    # STEP 5
+    # Physical containment check.
     #
-    # This also prevents symlink escapes.
+    # This prevents symlink escapes.
     # --------------------------------------------------------
 
     try:
@@ -247,12 +276,15 @@ def execute_read_file(path):
 
     try:
 
-        resolved = resolve_file_path(path)
+        resolved = resolve_file_path(
+            path
+        )
 
     except (ValueError, PermissionError) as exc:
 
         return None, str(exc)
 
+    # Only ordinary files may be returned.
     if not os.path.isfile(resolved):
 
         return None, (
@@ -279,33 +311,38 @@ def execute_read_file(path):
 
 
 # ============================================================
-# NETWORK GUARDRAIL
+# IP SECURITY
 # ============================================================
 
 def is_dangerous_ip(ip_text):
 
     try:
 
-        ip = ipaddress.ip_address(ip_text)
+        ip = ipaddress.ip_address(
+            ip_text
+        )
 
     except ValueError:
 
         return True
 
-    # is_global=False covers things such as:
+    # is_global=False rejects addresses such as:
     #
-    # 127.0.0.1       loopback
-    # 10.x.x.x        private
-    # 172.16-31.x.x   private
-    # 192.168.x.x     private
-    # 169.254.x.x     link-local / metadata-style
-    # ::1             IPv6 loopback
-    # fc00::/7        IPv6 private
+    # 127.0.0.1
+    # 10.x.x.x
+    # 172.16.x.x - 172.31.x.x
+    # 192.168.x.x
+    # 169.254.x.x
+    # ::1
     #
-    # plus reserved/multicast/unspecified addresses.
+    # plus link-local, multicast, unspecified and reserved IPs.
 
     return not ip.is_global
 
+
+# ============================================================
+# URL SECURITY
+# ============================================================
 
 def validate_url(url):
 
@@ -323,7 +360,7 @@ def validate_url(url):
             "URL must not be empty."
         )
 
-    # Reject control characters.
+    # Reject embedded control characters.
     if any(
         ord(character) < 32
         for character in url
@@ -335,7 +372,9 @@ def validate_url(url):
 
     try:
 
-        parsed = urlsplit(url)
+        parsed = urlsplit(
+            url
+        )
 
     except Exception:
 
@@ -345,8 +384,8 @@ def validate_url(url):
 
     scheme = parsed.scheme.lower()
 
-    # The policy restricts hosts, not just HTTPS URLs.
-    # Allow normal HTTP and HTTPS for the approved hosts.
+    # The assignment restricts destinations by host.
+    # Support both ordinary HTTP and HTTPS URLs.
     if scheme not in {
         "http",
         "https"
@@ -357,13 +396,13 @@ def validate_url(url):
         )
 
     # --------------------------------------------------------
-    # Block userinfo confusion.
+    # BLOCK USERINFO CONFUSION
     #
     # Example:
     #
-    # https://example.com@evil.com/
+    # https://example.com@evil.example/
     #
-    # The actual host there is evil.com.
+    # Here evil.example is the real hostname.
     # --------------------------------------------------------
 
     if (
@@ -392,11 +431,10 @@ def validate_url(url):
             "URL has no hostname."
         )
 
-    # DNS hostnames are case-insensitive.
     hostname = hostname.lower().rstrip(".")
 
     # --------------------------------------------------------
-    # EXACT hostname allowlist.
+    # EXACT HOST CHECK
     #
     # Allowed:
     #
@@ -405,10 +443,10 @@ def validate_url(url):
     #
     # Blocked:
     #
+    # example.com.evil.example
     # evil-example.com
-    # example.com.evil.com
     # sub.example.com
-    # www.iana.org.attacker.com
+    # www.iana.org.attacker.example
     # --------------------------------------------------------
 
     if hostname not in ALLOWED_HOSTS:
@@ -418,7 +456,7 @@ def validate_url(url):
         )
 
     # --------------------------------------------------------
-    # Only normal web ports.
+    # STANDARD PORT CHECK
     # --------------------------------------------------------
 
     if scheme == "https":
@@ -448,7 +486,7 @@ def validate_url(url):
             )
 
     # --------------------------------------------------------
-    # Resolve hostname and reject non-public addresses.
+    # DNS RESOLUTION
     # --------------------------------------------------------
 
     try:
@@ -483,9 +521,15 @@ def validate_url(url):
             "Destination hostname resolved to no addresses."
         )
 
+    # --------------------------------------------------------
+    # PRIVATE / LOOPBACK / METADATA CHECK
+    # --------------------------------------------------------
+
     for address in addresses:
 
-        if is_dangerous_ip(address):
+        if is_dangerous_ip(
+            address
+        ):
 
             return False, (
                 "Destination resolved to a non-public address."
@@ -497,12 +541,126 @@ def validate_url(url):
 
 
 # ============================================================
-# SAFE URL FETCH
+# UPGRADE ALLOWED HTTP URL TO HTTPS
+# ============================================================
+
+def upgrade_allowed_http_to_https(url):
+
+    """
+    Render or the remote site may reject a plain HTTP connection.
+
+    The policy allows the exact destination hosts, so for the two
+    explicitly permitted hosts we can safely upgrade an ordinary
+    HTTP request to HTTPS before performing the fetch.
+
+    This does NOT broaden the hostname allowlist.
+    """
+
+    try:
+
+        parsed = urlsplit(
+            url
+        )
+
+    except Exception:
+
+        return url
+
+    if parsed.scheme.lower() != "http":
+
+        return url
+
+    try:
+
+        hostname = parsed.hostname
+        port = parsed.port
+
+    except ValueError:
+
+        return url
+
+    if not hostname:
+
+        return url
+
+    hostname = hostname.lower().rstrip(".")
+
+    # Never rewrite an unapproved host.
+    if hostname not in ALLOWED_HOSTS:
+
+        return url
+
+    # Only ordinary HTTP port may be upgraded.
+    if port not in {
+        None,
+        80
+    }:
+
+        return url
+
+    # Preserve the original path.
+    path = parsed.path or "/"
+
+    upgraded = (
+        "https://"
+        + hostname
+        + path
+    )
+
+    # Preserve query parameters.
+    if parsed.query:
+
+        upgraded += (
+            "?"
+            + parsed.query
+        )
+
+    # Fragments are not sent to HTTP servers and therefore
+    # do not need to be included in the outbound request.
+
+    return upgraded
+
+
+# ============================================================
+# SAFE HTTP FETCH
 # ============================================================
 
 def execute_fetch_url(url):
 
-    current_url = url
+    # --------------------------------------------------------
+    # STEP 1
+    # Validate ORIGINAL user-supplied URL.
+    #
+    # This is important. We do not rewrite something malicious
+    # before checking whether it was allowed.
+    # --------------------------------------------------------
+
+    valid, reason = validate_url(
+        url
+    )
+
+    if not valid:
+
+        return None, reason
+
+    # --------------------------------------------------------
+    # STEP 2
+    # Upgrade allowed plain HTTP destination to HTTPS.
+    #
+    # This specifically handles environments where:
+    #
+    # http://www.iana.org/
+    #
+    # cannot be fetched normally, while:
+    #
+    # https://www.iana.org/
+    #
+    # works.
+    # --------------------------------------------------------
+
+    current_url = upgrade_allowed_http_to_https(
+        url
+    )
 
     session = requests.Session()
 
@@ -512,15 +670,14 @@ def execute_fetch_url(url):
     #
     # session.trust_env = False
     #
-    # Render may need its normal environment networking
-    # configuration for successful outbound requests.
+    # Render may depend on normal environment networking.
 
     for redirect_number in range(
         MAX_REDIRECTS + 1
     ):
 
         # ----------------------------------------------------
-        # Validate BEFORE making the request.
+        # VALIDATE DESTINATION BEFORE CONTACTING IT
         # ----------------------------------------------------
 
         valid, reason = validate_url(
@@ -536,8 +693,7 @@ def execute_fetch_url(url):
             response = session.get(
                 current_url,
 
-                # CRITICAL:
-                # Never automatically follow redirects.
+                # NEVER automatically follow redirects.
                 allow_redirects=False,
 
                 timeout=(5, 10),
@@ -583,13 +739,24 @@ def execute_fetch_url(url):
                     "Too many redirects."
                 )
 
-            # Convert relative redirect to absolute URL.
+            # Handles both:
+            #
+            # /somewhere
+            #
+            # and:
+            #
+            # https://example.com/somewhere
+
             next_url = urljoin(
                 current_url,
                 location
             )
 
-            # Validate the redirect BEFORE contacting it.
+            # ------------------------------------------------
+            # SECURITY:
+            # Validate redirect BEFORE following it.
+            # ------------------------------------------------
+
             redirect_valid, redirect_reason = validate_url(
                 next_url
             )
@@ -601,7 +768,11 @@ def execute_fetch_url(url):
                     + redirect_reason
                 )
 
-            current_url = next_url
+            # If the allowed destination redirects to another
+            # plain HTTP URL on an allowed host, upgrade that too.
+            current_url = upgrade_allowed_http_to_https(
+                next_url
+            )
 
             continue
 
@@ -641,7 +812,10 @@ def execute_fetch_url(url):
 # HOME / HEALTH CHECK
 # ============================================================
 
-@app.route("/", methods=["GET"])
+@app.route(
+    "/",
+    methods=["GET"]
+)
 def home():
 
     return jsonify({
@@ -651,7 +825,7 @@ def home():
 
 
 # ============================================================
-# MAIN GUARDRAIL ENDPOINT
+# GUARDRAIL ENDPOINT
 # ============================================================
 
 @app.route(
